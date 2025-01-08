@@ -1,0 +1,759 @@
+---
+title: "Digipur"
+author: "Philipp Hölscher"
+date: "2024-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/philippholscher/Downloads/Masterthesis")
+```
+
+
+```{r}
+getwd()
+```
+
+
+
+```{r setup, include=FALSE}
+library(zoo)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(multivar)
+library(mlVAR)
+library(vars)
+library(brms)
+library(mgcv)
+library(purrr)
+library(otsfeatures)
+library(SBC)
+library(bayesplot)
+library(ggplot2)
+library(lubridate)
+library(loo)
+```
+## Data Loading and Manipulation
+
+
+```{r}
+raw_data <- read.csv('20231006_DigiPuR_AA_data_KiJu.csv', sep=';', header=TRUE)
+```
+
+```{r}
+KiJu_AA <- read.csv('20231006_DigiPuR_AA_data_KiJu.csv', sep=';', header=TRUE)
+
+# Select only the specified columns
+keep <- c('id', 'Start_date', 't70_k_k_sr_akad_5', 't70_k_k_sr_pos_1', 't70_k_k_sr_mv_8', 't70_k_k_schlaf_1', 't70_k_k_schlaf_2', 't70_k_k_wohlbefinden_1')
+KiJu_AA <- KiJu_AA[, keep]
+```
+
+
+```{r}
+get_mode <- function(x) {
+  # Exclude NAs
+  x <- na.omit(x)
+  # Calculate the most frequent value
+  uniq_vals <- unique(x)
+  uniq_vals[which.max(tabulate(match(x, uniq_vals)))]
+}
+
+# Replace NA values with the mode
+df <- KiJu_AA %>%
+  group_by(id) %>%
+  mutate(across(
+    c('t70_k_k_sr_akad_5', 't70_k_k_sr_pos_1', 't70_k_k_sr_mv_8', 
+      't70_k_k_schlaf_1', 't70_k_k_schlaf_2', 't70_k_k_wohlbefinden_1'),
+    ~ ifelse(is.na(.), get_mode(.), .)
+  )) %>%
+  ungroup()
+```
+
+
+```{r}
+nested_df <- lapply(split(df, df$id), function(group) {
+  rownames(group) <- NULL  # Reset row names
+  group[,]  # Remove 'id' column
+})
+```
+
+```{r}
+time_series_data <- list(list())
+regression_data <- list(list())
+```
+
+```{r}
+x <- 1
+y <- 1
+for (i in 1:length(nested_df)){
+  dummy <- as.data.frame(nested_df[[i]])
+  dummy <- subset(dummy,select = -Start_date)
+  
+
+  if (dim(dummy)[1]>20){
+    
+    time_series_data[[x]] <- dummy
+    x <- x +1
+  }else{
+    
+    regression_data[[y]] <- dummy
+    y <- y +1
+  }
+}
+```
+
+## ACF
+Let's investigate the ACF plots.
+```{r}
+acf(time_series_data[[1]][["t70_k_k_schlaf_2"]],lag=7)
+```
+
+## Model builduing
+Adjust control settings to ensure proper convergence and avoid divergent trajactories.
+```{r}
+control <- list(
+  adapt_engaged = TRUE,
+  adapt_delta = 0.99, 
+  stepsize = 0.05, # 0.05 default
+  max_treedepth = 50
+)
+```
+
+
+### Training
+Simple Training Loop.
+```{r}
+for (i in (1:6)){#(1:length(time_series_data))
+  train_data <- time_series_data[[i]]
+  test_data <- train_data[21:length(train_data),1:7]
+  train_data_sub <- train_data[1:20,1:7]
+  save_data(train_data_sub,test_data,i)
+  cum_fit <- trainloop_2(train_data_sub,control,name,i)
+}
+```
+
+
+
+Safe Training Data.
+```{r}
+save_data <- function(train_data_sub,test_data,i){
+  data_name <- paste0("train_data_sub/train_data_sub_", i, ".rds")
+  file_path <- file.path(getwd(), data_name)
+  saveRDS(train_data_sub,file=file_path)
+  data_name2 <- paste0("test_data/test_data_", i, ".rds")
+  file_path2 <- file.path(getwd(), data_name2)
+  saveRDS(train_data_sub,file=file_path2)  
+}
+```
+
+This function Trains the Time Series Models.
+```{r}
+trainloop <- function(train_data_sub,control,name,i){
+  cum_fit <- brm(formula = mvbind(t70_k_k_sr_akad_5,t70_k_k_sr_pos_1,t70_k_k_sr_mv_8,t70_k_k_schlaf_1,t70_k_k_schlaf_2,t70_k_k_wohlbefinden_1)
+ ~ ar(p = 1), data = train_data_sub, family=cumulative("cauchit")
+  ,chains = 4,iter = 10000,warmup = 2000,init = '0',control=control)
+  model_name <- paste0("models/cum_fit_", i, ".rds")
+  file_path <- file.path(getwd(), model_name)
+  saveRDS(cum_fit,file=file_path)
+  return(cum_fit)
+}
+```
+
+This function Trains the Mean Models.
+```{r}
+trainloop_2 <- function(train_data_sub,control,name,i){
+  mean_model <- brm(formula = mvbind(t70_k_k_sr_akad_5,t70_k_k_sr_pos_1,t70_k_k_sr_mv_8,t70_k_k_schlaf_1,t70_k_k_schlaf_2,t70_k_k_wohlbefinden_1)
+ ~ 1, data = train_data_sub, family=cumulative("cauchit")
+  ,chains = 4,iter = 10000,warmup = 2000,init = '0',control=control)
+  model_name <- paste0("models_mean/mean_model_", i, ".rds")
+  file_path <- file.path(getwd(), model_name)
+  saveRDS(mean_model,file=file_path)
+  return(mean_model)
+}
+```
+
+### Evaluation
+
+This function gets the predictions.
+```{r}
+get_predictions <- function(cum_fit){
+  predictions_prob <- posterior_predict(cum_fit)
+  predictions <- as.data.frame(predictions_prob[1,1:20,1:6])
+  return(predictions)
+}
+```
+
+
+
+### Predictions and confuison matrix
+
+This function creates confuison matrices.
+```{r}
+calculate_confusion_matrices <- function(predictions_sample, test_data, labels, value_names) {
+  # Initialize an empty list to store confusion matrices
+  confusion_matrices <- list()
+  column_name <- colnames(test_data)
+  
+  # Iterate over each column in the test_data DataFrame
+  for (i in 1:ncol(test_data)) { # Use ncol() to get the number of columns
+    
+    
+    
+    # Calculate the confusion matrix
+    conf_matrix <- table(
+      factor(predictions_sample[[i]], levels = labels),
+      factor(test_data[[i]], levels = labels)
+    )
+    
+    # Set the dimension names
+    dimnames(conf_matrix) <- list(
+      "Predicted" = value_names,
+      "Actual" = value_names # Fix this to directly assign "Actual" as the label
+    )
+    
+    # Save the confusion matrix in the list with the column name
+    confusion_matrices[[column_name[i]]] <- conf_matrix
+  }
+  
+  # Return the list of confusion matrices
+  return(confusion_matrices)
+}
+```
+
+
+
+
+
+
+
+This function iterates over the models and calls the confusion matrices function. Then saves the matrices.
+```{r}
+process_folders <- function(models_folder, data_folder, output_folder, labels, value_names) {
+  # Create output folder if it doesn't exist
+  if (!dir.exists(output_folder)) {
+    dir.create(output_folder)
+  }
+  
+  # Get lists of models and data files
+  model_files <- list.files(models_folder, full.names = TRUE, pattern = "\\.rds$")
+  data_files <- list.files(data_folder, full.names = TRUE, pattern = "\\.rds$")
+  
+  # Ensure corresponding files match in order
+  if (length(model_files) != length(data_files)) {
+    stop("The number of model files and data files must be the same.")
+  }
+  
+  # Iterate over models and test data
+  for (i in seq_along(model_files)) {
+    # Load the model and test data
+    model <- readRDS(model_files[i])
+    test_data <- readRDS(data_files[i])
+    
+    test_data <- test_data[, !(names(test_data) %in% "id")]
+    
+    # Generate predictions
+    predictions <- get_predictions(model)
+    predictions <- predictions[1:dim(test_data)[1],]
+
+    
+    # Calculate confusion matrices
+    confusion_matrices <- calculate_confusion_matrices(predictions, test_data, labels, value_names)
+    
+    # Save the confusion matrices as an RDS file
+    output_file <- file.path(output_folder, paste0("confusion_matrix_", i, ".rds"))
+    saveRDS(confusion_matrices, output_file)
+    
+    # Print progress
+    cat("Saved confusion matrix for file", i, "to", output_file, "\n")
+  }
+}
+
+```
+
+Call the functions for mean models.
+```{r}
+# Example usage
+models_folder <- "/Users/philippholscher/Downloads/Masterthesis/models_mean"  # Replace with your folder path
+data_folder <- "/Users/philippholscher/Downloads/Masterthesis/test_data"      # Replace with your folder path
+output_folder <- "/Users/philippholscher/Downloads/Masterthesis/confusion_matrix_mean"  # Replace with your folder path
+
+labels <- c(1,2,3,4,5)
+value_names <- c("Value 1", "Value 2", "Value 3", "Value 4", "Value 5")
+
+process_folders(models_folder, data_folder, output_folder, labels, value_names)
+```
+
+Call the functions for AR models.
+```{r}
+# Example usage
+models_folder <- "/Users/philippholscher/Downloads/Masterthesis/models"  # Replace with your folder path
+data_folder <- "/Users/philippholscher/Downloads/Masterthesis/test_data"      # Replace with your folder path
+output_folder <- "/Users/philippholscher/Downloads/Masterthesis/confusion_matrix"  # Replace with your folder path
+
+labels <- c(1,2,3,4,5)
+value_names <- c("Value 1", "Value 2", "Value 3", "Value 4", "Value 5")
+
+process_folders(models_folder, data_folder, output_folder, labels, value_names)
+```
+
+
+
+
+
+## PPC 
+
+Function iterates over models, calculates PPC and saves them.
+```{r}
+ppc_check_all_models <- function(input_folder, output_folder) {
+  # Ensure output folder exists
+  if (!dir.exists(output_folder)) {
+    dir.create(output_folder, recursive = TRUE)
+  }
+  
+  # List all .rds files in the input folder
+  model_files <- list.files(input_folder, pattern = "\\.rds$", full.names = TRUE)
+  
+  # Define the response variables for pp_check
+  response_vars <- c('t70kksrakad5', 't70kksrpos1', 't70kksrmv8', 
+                     't70kkwohlbefinden1', 't70kkschlaf1', 't70kkschlaf2')
+  
+  # Iterate over each model file
+  for (model_file in model_files) {
+    # Load the model
+    cum_fit <- readRDS(model_file)
+    
+    # Extract the base model name without path and extension
+    model_name <- tools::file_path_sans_ext(basename(model_file))
+    
+    # Iterate over each response variable
+    for (resp_var in response_vars) {
+      # Generate the posterior predictive check plot
+      pp_plot <- pp_check(cum_fit, resp = resp_var, ndraws = 1000, type = 'bars')
+      
+      # Create a unique filename for each plot
+      plot_filename <- paste0(output_folder, "/", model_name, "_", resp_var, ".png")
+      
+      # Save the plot
+      ggsave(plot_filename, plot = pp_plot, width = 8, height = 6)
+    }
+  }
+  
+  cat("Posterior predictive checks completed and saved in", output_folder, "\n")
+}
+
+```
+
+Call function for AR models.
+```{r}
+#/Users/philippholscher/Downloads/Masterthesis/models
+#/Users/philippholscher/Downloads/Masterthesis/ppc_check
+
+ppc_check_all_models("/Users/philippholscher/Downloads/Masterthesis/models", "/Users/philippholscher/Downloads/Masterthesis/ppc_check")
+```
+Call function for mean models.
+
+```{r}
+ppc_check_all_models("/Users/philippholscher/Downloads/Masterthesis/models_mean", "/Users/philippholscher/Downloads/Masterthesis/ppc_check_mean")
+```
+
+
+## WAIC and LOO
+
+Function calculates LOO comparison for mean models and AR counterparts and saves them.
+```{r}
+compare_models_to_df <- function(folder1, folder2) {
+  # List all model files in both folders
+  models_folder1 <- list.files(folder1, full.names = TRUE)
+  models_folder2 <- list.files(folder2, full.names = TRUE)
+  
+  # Ensure the number of models matches
+  if (length(models_folder1) != length(models_folder2)) {
+    stop("The number of models in the two folders does not match!")
+  }
+  
+
+  
+  # Initialize lists to store loo objects and comparisons
+  loo1_list <- list()
+  loo2_list <- list()
+  loo_comparisons <- list()
+  
+  # Iterate through models and compare
+  for (i in seq_along(models_folder1)) {
+    # Load models
+    model1 <- readRDS(models_folder1[i])
+    model2 <- readRDS(models_folder2[i])
+    
+    # Compute `loo` for both models
+    loo1 <- loo(model1)
+    loo2 <- loo(model2)
+    
+    # Save loo objects in their respective lists
+    loo1_list[[i]] <- loo1
+    loo2_list[[i]] <- loo2
+    
+    # Compare models
+    loo_comparison <- loo_compare(loo1, loo2)
+    
+    # Save loo_comparison in the list
+    loo_comparisons[[i]] <- loo_comparison
+    
+
+
+  }
+  
+  # Return the results and loo objects
+  return(list(
+    loo1_list = loo1_list,
+    loo2_list = loo2_list,
+    loo_comparisons = loo_comparisons
+  ))
+}
+
+```
+
+
+
+Call function.
+```{r}
+folder1 <- "/Users/philippholscher/Downloads/Masterthesis/models"
+folder2 <- "/Users/philippholscher/Downloads/Masterthesis/models_mean"
+
+# Get the comparison results as a data frame
+comparison_results <- compare_models_to_df(folder1, folder2)
+
+```
+
+
+Print Loo Comparison.
+```{r}
+loo_comp_1 <- comparison_results[["loo_comparisons"]][[1]]
+print(loo_comp_1,simplify = FALSE)
+```
+
+```{r}
+confusion_matrix<- readRDS("/Users/philippholscher/Downloads/Masterthesis/confusion_matrix/confusion_matrix_1.rds")
+
+confusion_matrix_mean<- readRDS("/Users/philippholscher/Downloads/Masterthesis/confusion_matrix_mean/confusion_matrix_1.rds")
+```
+
+
+
+
+```{r}
+print(confusion_matrix)
+```
+
+
+
+```{r}
+print(confusion_matrix_mean)
+
+```
+
+
+##### Logistic Regression
+
+Data Preprocessing for Logistic Regression.
+```{r}
+regression_last_data <- map(regression_data, ~ .x[nrow(.x), ])
+regression_last_data <- map(regression_last_data, ~ .x %>% ungroup()) %>%
+  bind_rows()
+```
+
+
+```{r}
+data_big <- read.csv('20231006_DigiPuR_final_data.csv', sep=';', header=TRUE)
+```
+
+
+```{r}
+data_filtered_test <- subset(data_big,pers=='KiJu',select = c('id','date','t1_kd_alter','t1_kd_geschlecht','t1_kd_iq_wert','t1_kd_klassenwiederholungen','t4_kd_wiederauf_fu2'))
+```
+
+
+
+
+```{r}
+data_cleaned <- data_filtered_test %>%
+  group_by(id) %>%
+  slice(1) %>%  # Keeps the first row in each group
+  ungroup()
+```
+
+
+```{r}
+train_data_regression <- regression_last_data %>%
+  inner_join(data_cleaned, by = "id")
+```
+
+```{r}
+train_data_regression$age <- as.Date(train_data_regression$t1_kd_alter, origin = "1899-12-30")
+```
+
+```{r}
+train_data_regression <- train_data_regression %>%
+  mutate(
+    date = dmy(date),  
+    age = ymd(age)  
+  )
+train_data_regression <- train_data_regression %>%
+  mutate(
+    age_at_start = round(as.numeric(difftime(date, age, units = "days")) / 365.25)
+  )
+
+```
+
+```{r}
+train_data_regression <- train_data_regression[, !(names(train_data_regression) %in% c("date", "age","t1_kd_alter"))]
+```
+
+```{r}
+train_data_regression$t1_kd_klassenwiederholungen[is.na(train_data_regression$t1_kd_klassenwiederholungen)] <- 0
+train_data_regression$t1_kd_geschlecht <- ifelse(train_data_regression$t1_kd_geschlecht == "m", 0, ifelse(train_data_regression$t1_kd_geschlecht == "w", 1, NA))
+train_data_regression$t4_kd_wiederauf_fu2 <- ifelse(train_data_regression$t4_kd_wiederauf_fu2 == 4, 0, 1)
+
+```
+
+```{r}
+train_data_regression$t1_kd_iq_wert <- log(train_data_regression$t1_kd_iq_wert)
+train_data_regression$age_at_start <- log(train_data_regression$age_at_start)
+```
+
+
+```{r}
+train_data_regression <- na.omit(train_data_regression)
+```
+
+```{r}
+train_data_regression$t1_kd_iq_wert <- as.integer(train_data_regression$t1_kd_iq_wert)
+```
+
+
+
+### Model
+Fit the different models and calculate LOO.
+```{r}
+final_model <- brm(formula = t4_kd_wiederauf_fu2 ~ t70_k_k_sr_pos_1 + t70_k_k_sr_akad_5 + t70_k_k_sr_mv_8 + t70_k_k_schlaf_1 + t70_k_k_schlaf_2 + t70_k_k_wohlbefinden_1,  
+                   data=train_data_regression, 
+                   family = bernoulli(link = "logit"),
+                   warmup = 2000, 
+                   iter = 15000,
+                   init = '0' )
+```
+
+```{r}
+summary(final_model)
+```
+
+
+```{r}
+timeseries_loo <- loo(final_model)
+```
+
+
+```{r}
+final_model_big <- brm(formula = t4_kd_wiederauf_fu2 ~ t70_k_k_sr_pos_1 + t70_k_k_sr_akad_5 + t70_k_k_sr_mv_8 + t70_k_k_schlaf_1 + t70_k_k_schlaf_2 + t70_k_k_wohlbefinden_1 +t1_kd_klassenwiederholungen,  
+                   data=train_data_regression, 
+                   family = bernoulli(link = "logit"),
+                   warmup = 2000, 
+                   iter = 15000,
+                   init = '0')
+```
+
+```{r}
+summary(final_model_big)
+```
+
+
+```{r}
+timeseries_klassenwieder_loo <- loo(final_model_big)
+```
+
+
+```{r}
+final_model_3 <- brm(formula = t4_kd_wiederauf_fu2 ~ t70_k_k_sr_pos_1 + t70_k_k_sr_akad_5 + t70_k_k_sr_mv_8 + t70_k_k_schlaf_1  + t70_k_k_wohlbefinden_1 +t1_kd_iq_wert + t1_kd_klassenwiederholungen,  
+                   data=train_data_regression, 
+                   family = bernoulli(link = "logit"),
+                  warmup = 2000, 
+                   iter = 15000,
+                   init = '0')
+```
+
+```{r}
+summary(final_model_3)
+```
+
+
+```{r}
+timeseries_iq_klassenwieder_loo <- loo(final_model_3)
+```
+
+
+
+```{r}
+variational_inference_model = brm(formula = t4_kd_wiederauf_fu2 ~ t70_k_k_sr_pos_1 + t70_k_k_sr_akad_5 + t70_k_k_sr_mv_8 + t70_k_k_schlaf_1 + t70_k_k_schlaf_2 + t70_k_k_wohlbefinden_1 + t1_kd_geschlecht+t1_kd_iq_wert + t1_kd_klassenwiederholungen +age_at_start,  
+                   data=train_data_regression, 
+                   family = bernoulli(link = "logit"),
+                   warmup = 2000, 
+                   iter = 15000,
+                   init = '0',algorithm = "meanfield",chain=4 )
+```
+
+
+```{r}
+summary(variational_inference_model)
+```
+
+```{r}
+vi_loo <- loo(variational_inference_model,moment_match = TRUE,reloo = TRUE)
+```
+
+
+
+```{r}
+loo_final_model <- loo_compare(vi_loo,timeseries_iq_klassenwieder_loo,timeseries_klassenwieder_loo,timeseries_loo)
+```
+
+Print LOO Comparison.
+```{r}
+print(loo_final_model,simplify = FALSE)
+```
+#### Test Model on Test Data
+
+
+
+```{r}
+test_pred <- get_predictions(cum_fit)
+test_pred <- head(test_pred,1)
+```
+
+```{r}
+new_names <- c(
+  't70_k_k_sr_pos_1', 
+  't70_k_k_sr_akad_5', 
+  't70_k_k_sr_mv_8', 
+  't70_k_k_schlaf_1', 
+  't70_k_k_schlaf_2', 
+  't70_k_k_wohlbefinden_1'
+)
+```
+
+
+Function to get the logistic predictions.
+```{r}
+# Define the function
+get_model_predictions_logistic <- function(folder_path, new_colnames, newdata_function) {
+  # List all model files in the folder
+  model_files <- list.files(folder_path, full.names = TRUE)
+  
+  # Initialize a list to store predictions
+  predictions_list <- list()
+  
+  # Iterate over model files
+  for (file in model_files) {
+    # Load the model (assuming models are RData files with a single object named cum_fit)
+    model <- readRDS(file)
+    
+    
+    test_pred <- get_predictions(model)
+    
+    # Process the predictions (e.g., take the first row)
+    test_pred <- head(test_pred, 1)
+    
+    # Rename columns
+    colnames(test_pred) <- new_colnames
+    
+    # Generate predictions using the final model
+    pred <- predict(final_model, newdata = test_pred)
+    
+    # Append predictions to the list
+    predictions_list[[basename(file)]] <- pred
+  }
+  
+  # Return the list of predictions
+  return(predictions_list)
+}
+
+```
+
+Call function with mean models.
+```{r}
+logistic_predictions <- get_model_predictions_logistic(folder_path ="/Users/philippholscher/Downloads/Masterthesis/models_mean",new_colnames =new_names ,newdata_function = get_predictions())
+```
+
+Bring predictions in nice format.
+```{r}
+id_list <- lapply(time_series_data, function(x) x$id)
+id_vector <- unlist(id_list)
+prediction_list <- lapply(logistic_predictions,function(x) round(x[1]))
+id_list <- as.list(id_vector)
+```
+
+
+
+```{r}
+df_final <- data.frame(
+  id = rep(NA, 32),
+  prediction = rep(NA, 32))
+df_final$id <- id_vector
+df_final$prediction <- prediction_list
+```
+
+```{r}
+joined_df <- inner_join(df_final, data_filtered_test, by = "id")
+```
+
+```{r}
+joined_df_cleaned <- joined_df %>%
+  group_by(id) %>%
+  slice(1) %>%  # Keeps the first row in each group
+  ungroup()
+```
+
+```{r}
+joined_df_cleaned <- joined_df_cleaned[, !(names(joined_df_cleaned) %in% c("date", "t1_kd_geschlecht", "t1_kd_alter","t1_kd_iq_wert","t1_kd_klassenwiederholungen","id"))]
+```
+Create Confusion Matrices
+```{r}
+joined_df_cleaned$t4_kd_wiederauf_fu2<- ifelse(joined_df_cleaned$t4_kd_wiederauf_fu2 == 4, 0, 1)
+```
+
+
+```{r}
+conf_matrix_final <- table(unlist(joined_df_cleaned$prediction),joined_df_cleaned$t4_kd_wiederauf_fu2)
+rownames(conf_matrix_final) <- c("Predicted 0", "Predicted 1")
+colnames(conf_matrix_final) <- c("Actual 0", "Actual 1")
+```
+
+```{r}
+conf_matrix_final
+```
+PPC for Logistic Model.
+```{r}
+pp_check(final_model,type='bars')
+```
+
+
+
+
+
+
+```{r}
+model_ar <- readRDS('/Users/philippholscher/Downloads/Masterthesis/models/cum_fit_1.rds')
+model_mean <- readRDS('/Users/philippholscher/Downloads/Masterthesis/models_mean/mean_model_1.rds')
+```
+
+
+
+
+```{r}
+summary(model_mean)
+```
+
+```{r}
+summary(final_model)
+```
+
+
