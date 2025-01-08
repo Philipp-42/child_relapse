@@ -1,0 +1,132 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(brms)
+library(dplyr)
+library(rstan)
+library(sbc)
+```
+
+## Simulation-Based Calibration
+
+#### Generate Data
+
+To perform the SBC we need an artificial data set so the function knows the structure of the data.
+
+```{r}
+set.seed(213452)
+template_data = data.frame( t70kksrakad5 = rep(2, 15),t70kksrpos1 = rep(1, 15),t70kksrmv8 = rep(3, 15), t70kkschlaf1 = rep(4, 15), t70kkschlaf2 = rep(5, 15),t70kkwohlbefinden1 = rep(3, 15))
+```
+
+#### Priors
+
+Define the priors of the models, for sampling.
+
+```{r}
+priors_mean <- c(
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkschlaf1"),
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkschlaf2"),
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrakad5"),
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrmv8"),
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrpos1"),
+    prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkwohlbefinden1")
+)
+```
+
+```{r}
+priors <- c(
+  prior(uniform(-1,1), class = "ar", resp = "t70kkschlaf1",lb=-1,ub=1),
+  prior(uniform(-1,1), class = "ar", resp = "t70kkschlaf2",lb=-1,ub=1),
+  prior(uniform(-1,1), class = "ar", resp = "t70kksrakad5",lb=-1,ub=1),
+  prior(uniform(-1,1), class = "ar", resp = "t70kksrmv8",lb=-1,ub=1),
+  prior(uniform(-1,1), class = "ar", resp = "t70kksrpos1",lb=-1,ub=1),
+  prior(uniform(-1,1), class = "ar", resp = "t70kkwohlbefinden1",lb=-1,ub=1),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkschlaf1"),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkschlaf2"),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrakad5"),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrmv8"),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kksrpos1"),
+  prior(student_t(3, 0, 2.5), class = "Intercept", resp = "t70kkwohlbefinden1")
+)
+```
+
+### SBC
+
+Here we create datagenerators by combining the artificial data set and the defined priors.
+
+```{r}
+set.seed(213452)
+
+
+generator <- SBC_generator_brms(mvbind(t70kksrakad5,t70kksrpos1,t70kksrmv8,t70kkschlaf1,t70kkschlaf2,t70kkwohlbefinden1)
+ ~ ar(p = 1), data = template_data, prior = priors, 
+                                thin = 50, warmup = 1000, refresh = 200)
+```
+
+```{r}
+set.seed(213452)
+
+
+generator_mean <- SBC_generator_brms(mvbind(t70kksrakad5,t70kksrpos1,t70kksrmv8,t70kkschlaf1,t70kkschlaf2,t70kkwohlbefinden1)
+ ~ 1, data = template_data, prior = priors_mean, 
+                                thin = 50, warmup = 1000, refresh = 200)
+```
+
+Now we generate the artificial data set.
+
+```{r}
+datasets <- generate_datasets(generator, 100)
+```
+
+```{r}
+datasets_mean <- generate_datasets(generator_mean, 100)
+```
+
+Now we create a so-called backend, that is later used with the generated artificial data set to perform the actual SBC.
+
+```{r}
+backend <- SBC_backend_brms_from_generator(generator, chains = 1, thin = 1,
+                            warmup = 500, iter = 1500,               
+                            inits = 0.1)
+```
+
+```{r}
+backend_mean <- SBC_backend_brms_from_generator(generator_mean, chains = 1, thin = 1,
+                            warmup = 500, iter = 1500,               
+                            inits = 0.1)
+```
+
+SBC is being computed.
+
+```{r}
+results_mean <- compute_SBC(datasets_mean, backend_mean)
+```
+
+```{r}
+results <- compute_SBC(datasets, backend)
+```
+
+### Results
+
+Visualize the Results.
+
+```{r}
+plot_rank_hist(results_mean)
+```
+
+```{r}
+plot_rank_hist(results)
+
+```
+
+```{r}
+plot_ecdf_diff(results)
+
+```
+
+```{r}
+plot_ecdf_diff(results_mean)
+```
